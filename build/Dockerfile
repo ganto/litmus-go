@@ -34,6 +34,7 @@ COPY --from=builder /output/ /litmus
 COPY --from=dep /usr/bin/sudo /usr/bin/
 COPY --from=dep /sbin/tc /sbin/
 COPY --from=dep /sbin/iptables /sbin/
+COPY --from=dep /sbin/ip /sbin/
 
 #Copying Necessary Files
 COPY ./pkg/cloud/aws/common/ssm-docs/LitmusChaos-AWS-SSM-Docs.yml .

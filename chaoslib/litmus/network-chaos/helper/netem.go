@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -82,6 +83,11 @@ func preparePodNetworkChaos(experimentsDetails *experimentTypes.ExperimentDetail
 	if err != nil {
 		return err
 	}
+	// get network namespace
+	targetNS, err := getNetworkNS(targetPID)
+	if err != nil {
+		return err
+	}
 
 	// record the event inside chaosengine
 	if experimentsDetails.EngineName != "" {
@@ -91,10 +97,10 @@ func preparePodNetworkChaos(experimentsDetails *experimentTypes.ExperimentDetail
 	}
 
 	// watching for the abort signal and revert the chaos
-	go abortWatcher(targetPID, experimentsDetails.NetworkInterface, resultDetails.Name, chaosDetails.ChaosNamespace, experimentsDetails.TargetPods)
+	go abortWatcher(targetNS, experimentsDetails.NetworkInterface, resultDetails.Name, chaosDetails.ChaosNamespace, experimentsDetails.TargetPods)
 
 	// injecting network chaos inside target container
-	if err = injectChaos(experimentsDetails, targetPID); err != nil {
+	if err = injectChaos(experimentsDetails, targetNS); err != nil {
 		return err
 	}
 
@@ -109,7 +115,7 @@ func preparePodNetworkChaos(experimentsDetails *experimentTypes.ExperimentDetail
 	log.Info("[Chaos]: Stopping the experiment")
 
 	// cleaning the netem process after chaos injection
-	if err = killnetem(targetPID, experimentsDetails.NetworkInterface); err != nil {
+	if err = killnetem(targetNS, experimentsDetails.NetworkInterface); err != nil {
 		return err
 	}
 
@@ -117,9 +123,9 @@ func preparePodNetworkChaos(experimentsDetails *experimentTypes.ExperimentDetail
 }
 
 // injectChaos inject the network chaos in target container
-// it is using nsenter command to enter into network namespace of target container
-// and execute the netem command inside it.
-func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, pid int) error {
+// it is using `ip netns exec` command to enter into network namespace of target
+// container and execute the netem command inside it.
+func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, networkNS string) error {
 
 	netemCommands := os.Getenv("NETEM_COMMAND")
 
@@ -129,7 +135,7 @@ func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, pid int) 
 		os.Exit(1)
 	default:
 		if len(destIps) == 0 && len(sPorts) == 0 && len(dPorts) == 0 {
-			tc := fmt.Sprintf("sudo nsenter -t %d -n tc qdisc replace dev %s root netem %v", pid, experimentDetails.NetworkInterface, netemCommands)
+			tc := fmt.Sprintf("sudo ip netns exec %s tc qdisc replace dev %s root netem %v", networkNS, experimentDetails.NetworkInterface, netemCommands)
 			cmd := exec.Command("/bin/bash", "-c", tc)
 			out, err := cmd.CombinedOutput()
 			log.Info(cmd.String())
@@ -141,7 +147,7 @@ func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, pid int) 
 
 			// Create a priority-based queue
 			// This instantly creates classes 1:1, 1:2, 1:3
-			priority := fmt.Sprintf("sudo nsenter -t %v -n tc qdisc replace dev %v root handle 1: prio", pid, experimentDetails.NetworkInterface)
+			priority := fmt.Sprintf("sudo ip netns exec %s tc qdisc replace dev %v root handle 1: prio", networkNS, experimentDetails.NetworkInterface)
 			cmd := exec.Command("/bin/bash", "-c", priority)
 			out, err := cmd.CombinedOutput()
 			log.Info(cmd.String())
@@ -152,7 +158,7 @@ func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, pid int) 
 
 			// Add queueing discipline for 1:3 class.
 			// No traffic is going through 1:3 yet
-			traffic := fmt.Sprintf("sudo nsenter -t %v -n tc qdisc replace dev %v parent 1:3 netem %v", pid, experimentDetails.NetworkInterface, netemCommands)
+			traffic := fmt.Sprintf("sudo ip netns exec %s tc qdisc replace dev %v parent 1:3 netem %v", networkNS, experimentDetails.NetworkInterface, netemCommands)
 			cmd = exec.Command("/bin/bash", "-c", traffic)
 			out, err = cmd.CombinedOutput()
 			log.Info(cmd.String())
@@ -163,9 +169,9 @@ func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, pid int) 
 
 			for _, ip := range destIps {
 				// redirect traffic to specific IP through band 3
-				tc := fmt.Sprintf("sudo nsenter -t %v -n tc filter add dev %v protocol ip parent 1:0 prio 3 u32 match ip dst %v flowid 1:3", pid, experimentDetails.NetworkInterface, ip)
+				tc := fmt.Sprintf("sudo ip netns exec %s tc filter add dev %v protocol ip parent 1:0 prio 3 u32 match ip dst %v flowid 1:3", networkNS, experimentDetails.NetworkInterface, ip)
 				if strings.Contains(ip, ":") {
-					tc = fmt.Sprintf("sudo nsenter -t %v -n tc filter add dev %v protocol ip parent 1:0 prio 3 u32 match ip6 dst %v flowid 1:3", pid, experimentDetails.NetworkInterface, ip)
+					tc = fmt.Sprintf("sudo ip netns exec %s tc filter add dev %v protocol ip parent 1:0 prio 3 u32 match ip6 dst %v flowid 1:3", networkNS, experimentDetails.NetworkInterface, ip)
 				}
 				cmd = exec.Command("/bin/bash", "-c", tc)
 				out, err = cmd.CombinedOutput()
@@ -178,7 +184,7 @@ func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, pid int) 
 
 			for _, port := range sPorts {
 				//redirect traffic to specific sport through band 3
-				tc := fmt.Sprintf("sudo nsenter -t %v -n tc filter add dev %v protocol ip parent 1:0 prio 3 u32 match ip sport %v 0xffff flowid 1:3", pid, experimentDetails.NetworkInterface, port)
+				tc := fmt.Sprintf("sudo ip netns exec %s tc filter add dev %v protocol ip parent 1:0 prio 3 u32 match ip sport %v 0xffff flowid 1:3", networkNS, experimentDetails.NetworkInterface, port)
 				cmd = exec.Command("/bin/bash", "-c", tc)
 				out, err = cmd.CombinedOutput()
 				log.Info(cmd.String())
@@ -190,7 +196,7 @@ func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, pid int) 
 
 			for _, port := range dPorts {
 				//redirect traffic to specific dport through band 3
-				tc := fmt.Sprintf("sudo nsenter -t %v -n tc filter add dev %v protocol ip parent 1:0 prio 3 u32 match ip dport %v 0xffff flowid 1:3", pid, experimentDetails.NetworkInterface, port)
+				tc := fmt.Sprintf("sudo ip netns exec %s tc filter add dev %v protocol ip parent 1:0 prio 3 u32 match ip dport %v 0xffff flowid 1:3", networkNS, experimentDetails.NetworkInterface, port)
 				cmd = exec.Command("/bin/bash", "-c", tc)
 				out, err = cmd.CombinedOutput()
 				log.Info(cmd.String())
@@ -205,9 +211,9 @@ func injectChaos(experimentDetails *experimentTypes.ExperimentDetails, pid int) 
 }
 
 // killnetem kill the netem process for all the target containers
-func killnetem(PID int, networkInterface string) error {
+func killnetem(networkNS string, networkInterface string) error {
 
-	tc := fmt.Sprintf("sudo nsenter -t %d -n tc qdisc delete dev %s root", PID, networkInterface)
+	tc := fmt.Sprintf("sudo ip netns exec %s tc qdisc delete dev %s root", networkNS, networkInterface)
 	cmd := exec.Command("/bin/bash", "-c", tc)
 	out, err := cmd.CombinedOutput()
 	log.Info(cmd.String())
@@ -225,7 +231,7 @@ func killnetem(PID int, networkInterface string) error {
 	return nil
 }
 
-//getENV fetches all the env variables from the runner pod
+// getENV fetches all the env variables from the runner pod
 func getENV(experimentDetails *experimentTypes.ExperimentDetails) {
 	experimentDetails.ExperimentName = types.Getenv("EXPERIMENT_NAME", "")
 	experimentDetails.InstanceID = types.Getenv("INSTANCE_ID", "")
@@ -271,7 +277,7 @@ func getDestinationIPs(ips string) []string {
 }
 
 // abortWatcher continuously watch for the abort signals
-func abortWatcher(targetPID int, networkInterface, resultName, chaosNS, targetPodName string) {
+func abortWatcher(targetNS string, networkInterface, resultName, chaosNS, targetPodName string) {
 
 	<-abort
 	log.Info("[Chaos]: Killing process started because of terminated signal received")
@@ -279,7 +285,7 @@ func abortWatcher(targetPID int, networkInterface, resultName, chaosNS, targetPo
 	// retry thrice for the chaos revert
 	retry := 3
 	for retry > 0 {
-		if err = killnetem(targetPID, networkInterface); err != nil {
+		if err = killnetem(targetNS, networkInterface); err != nil {
 			log.Errorf("unable to kill netem process, err :%v", err)
 		}
 		retry--
@@ -290,4 +296,23 @@ func abortWatcher(targetPID int, networkInterface, resultName, chaosNS, targetPo
 	}
 	log.Info("Chaos Revert Completed")
 	os.Exit(1)
+}
+
+// Get network namespace
+func getNetworkNS(pid int) (string, error) {
+	identify := fmt.Sprintf("sudo ip netns identify %d", pid)
+	cmd := exec.Command("/bin/bash", "-c", identify)
+	out, err := cmd.CombinedOutput()
+	log.Info(cmd.String())
+	if err != nil {
+		log.Error(string(out))
+		return "", err
+	}
+	ns := strings.TrimSpace(string(out))
+	if ns == "" {
+		log.Error("Query network namespace returned empty result")
+		return "", errors.New("Empty network namespace")
+	}
+	log.Info(fmt.Sprintf("[Info]: Container process PID=%d has network namespace ID=%s", pid, ns))
+	return ns, nil
 }
